@@ -1,0 +1,137 @@
+# playbook.yaml
+- name: Deploy fullstack ecommerce on Kubernetes
+  hosts: localhost
+  connection: local
+  gather_facts: yes
+  vars:
+    k8s_manifest_path: "./k8s/fullstackdeployment.yaml"
+    namespace: ecommerce
+    mysql_root_password: "root"          # change in production
+    mysql_database: "ecommerce"
+    mysql_user: "root"
+    mysql_password: "root"
+    ingress_host: "ecommerce.local"
+
+  tasks:
+
+    - name: Ensure docker service is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Start minikube if not running
+      shell: |
+        {% raw %}
+        if ! minikube status --format='{{.Host}}' 2>/dev/null | grep -q Running; then
+          minikube start --driver=docker --memory=4096 --cpus=2
+        else
+          echo "minikube already running"
+        fi
+        {% endraw %}
+      args:
+        executable: /bin/bash
+
+    - name: Ensure helm repo updated
+      shell: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx || true
+        helm repo update
+      args:
+        executable: /bin/bash
+
+    - name: Install ingress-nginx (if not present)
+      shell: |
+        if ! kubectl get ns ingress-nginx >/dev/null 2>&1; then
+          helm install ingress-nginx ingress-nginx/ingress-nginx \
+            --create-namespace --namespace ingress-nginx --wait
+        else
+          echo "ingress-nginx already installed"
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Install metrics-server for HPA
+      shell: |
+        if ! kubectl get deployment metrics-server -n kube-system >/dev/null 2>&1; then
+          helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ || true
+          helm repo update
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+        else
+          echo "metrics-server exists"
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Create namespace
+      shell: |
+        kubectl create namespace {{ namespace }} --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+
+    - name: Create MySQL secret
+      shell: |
+        kubectl -n {{ namespace }} create secret generic mysql-secret \
+          --from-literal=MYSQL_ROOT_PASSWORD={{ mysql_root_password }} \
+          --from-literal=MYSQL_DATABASE={{ mysql_database }} \
+          --from-literal=MYSQL_USER={{ mysql_user }} \
+          --from-literal=MYSQL_PASSWORD={{ mysql_password }} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      args:
+        executable: /bin/bash
+
+    - name: Copy manifest to remote /tmp
+      ansible.builtin.copy:
+        src: "{{ k8s_manifest_path }}"
+        dest: /tmp/fullstackdeployment.yaml
+        force: yes
+
+    - name: Apply k8s manifests
+      shell: kubectl apply -f /tmp/fullstackdeployment.yaml -n {{ namespace }}
+      args:
+        executable: /bin/bash
+
+    - name: Wait for deployments to be available
+      shell: |
+        kubectl wait --for=condition=available --timeout=300s deployment/backend -n {{ namespace }} || true
+        kubectl wait --for=condition=available --timeout=300s deployment/frontend -n {{ namespace }} || true
+        kubectl rollout status statefulset/mysql -n {{ namespace }} --timeout=300s || true
+      args:
+        executable: /bin/bash
+
+    - name: Show pods
+      shell: kubectl get pods -n {{ namespace }} -o wide
+      register: pods_out
+      args:
+        executable: /bin/bash
+
+    - name: Print pods
+      debug:
+        msg: "{{ pods_out.stdout }}"
+
+    - name: Show services
+      shell: kubectl get svc -n {{ namespace }} -o wide
+      register: svc_out
+      args:
+        executable: /bin/bash
+
+    - name: Print services
+      debug:
+        msg: "{{ svc_out.stdout }}"
+
+    - name: Print ingress (if created)
+      shell: kubectl get ingress -n {{ namespace }} -o wide || true
+      register: ingress_out
+      args:
+        executable: /bin/bash
+
+    - name: Print ingress output
+      debug:
+        msg: "{{ ingress_out.stdout }}"
+
+    - name: Show next steps / access info
+      debug:
+        msg:
+          - "If using minikube, run: minikube ip"
+          - "Then add that IP to /etc/hosts as: <minikube-ip> {{ ingress_host }}"
+          - "Then open in browser: http://{{ ingress_host }}/"
+          - "Backend API path is available via /api (as defined in your Ingress)."
